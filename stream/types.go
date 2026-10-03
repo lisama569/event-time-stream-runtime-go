@@ -83,6 +83,13 @@ type Config struct {
 	MaxOutofOrder   time.Duration
 	CheckpointPath  string
 	CheckpointEvery int64
+	// EmittedRetention 是已发布窗口结果在状态/检查点中的保留范围：
+	// 全局水位越过 window_end+lateness+EmittedRetention 后，该窗口的
+	// 已发布记录被安全遗忘（此后任何该窗口事件必然按水位判迟到）。
+	// 状态体积因此只与活跃窗口、迟到视界内的保留尾部相关，与累计
+	// 处理过的窗口总量无关。0 表示永久保留（兼容旧行为，状态随
+	// 累计窗口数增长）。
+	EmittedRetention time.Duration
 }
 
 // DefaultConfig 返回一组可用的默认配置。

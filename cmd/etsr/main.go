@@ -28,6 +28,8 @@ func main() {
 		queueSize = flag.Int("queue", 1024, "每源有界摄取队列容量（背压粒度）")
 		every     = flag.Int("every", 1000, "每处理多少条有效事件做一次检查点")
 		maxAhead  = flag.Int("max-ahead", 0, "事件时间相对全局水位最大超前秒数，超出判 OUT_OF_RANGE；0=不限制")
+		retention = flag.Int("retention", 0, "已发布结果在状态/检查点中的保留秒数（事件时间，关闭视界之后）；0=永久保留。长跑场景建议设为非 0 以约束状态体积")
+		statusSec = flag.Int("status-interval", 0, "运行中每隔多少秒向 stderr 打印一次状态摘要；0=不打印")
 		errLog    = flag.String("errors", "", "分类异常输出文件（JSON Lines 风格文本），默认 stderr")
 	)
 	flag.Parse()
@@ -58,6 +60,9 @@ func main() {
 	cfg.CheckpointPath = *ckptPath
 	if *maxAhead > 0 {
 		cfg.MaxOutofOrder = time.Duration(*maxAhead) * time.Second
+	}
+	if *retention > 0 {
+		cfg.EmittedRetention = time.Duration(*retention) * time.Second
 	}
 
 	paths := strings.Split(*inputs, ",")
@@ -111,6 +116,31 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	// 运行状态摘要：只读快照，不影响摄入。
+	if *statusSec > 0 {
+		go func() {
+			tick := time.NewTicker(time.Duration(*statusSec) * time.Second)
+			defer tick.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-tick.C:
+					s := eng.Status()
+					fmt.Fprintf(os.Stderr,
+						"status: active_windows=%d closed=%d retained=%d ingested=%d accepted=%d late=%d dup=%d malformed=%d sources=",
+						s.ActiveWindows, s.WindowsClosed, s.EmittedRetained,
+						s.Ingested, s.Accepted, s.LateDropped, s.Duplicates, s.Malformed)
+					for _, ss := range s.Sources {
+						fmt.Fprintf(os.Stderr, "[%s off=%d backlog=%d/%d done=%v] ",
+							ss.Name, ss.Offset, ss.Backlog, ss.QueueCap, ss.Finished)
+					}
+					fmt.Fprintln(os.Stderr)
+				}
+			}
+		}()
+	}
 
 	if err := eng.Run(ctx, sources, sink); err != nil {
 		var ce *stream.CheckpointError

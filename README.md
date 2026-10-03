@@ -16,6 +16,12 @@
   版本号魔数与窗口配置校验；损坏/缺失/版本不兼容/配置不一致均以**可区分原因**拒绝。
 - 提交后发布：窗口结果只在其所属状态成功落盘检查点后才写入输出；
   恢复时先按 `emit_seq` 确定序重放全部已提交结果，再处理新事件。
+- 长跑有界状态：`EmittedRetention` 限定已发布结果的保留范围，
+  内存与检查点体积只取决于活跃窗口与保留尾部，与累计窗口总量无关。
+- 结果确定：同一逻辑输入与到达顺序、源交错、重复投递无关；
+  小数值按确定顺序补偿求和，跨运行逐比特一致。
+- 运行状态摘要：`Engine.Status()` 在摄入进行中并发读取活跃窗口数、
+  已终结窗口数、各源积压与各类异常计数，用于判断状态是否有界。
 
 ## 目录结构
 
@@ -82,6 +88,83 @@ cmd/etsr/main.go        本地命令行入口
 每条异常都带 `source / offset / 原始内容 / 事件时间 / 当前全局水位 / 判定原因`，
 通过 `-errors` 指定文件（默认 stderr）输出。
 
+## 长跑场景：状态有界范围与保留策略
+
+长时间运行、键与窗口持续增长的场景下，状态体积只与以下三者相关，
+**与累计处理过的窗口总量无关**：
+
+1. **活跃（打开中的）窗口**：由水位推进自然约束——全局水位越过
+   `window_end + lateness` 窗口即关闭，数量上界约为
+   `(window + lateness) / window × 键基数`；
+2. **仍在等待迟到的已发布结果（保留尾部）**：由 `EmittedRetention`
+   （CLI `-retention`，单位秒）约束。全局水位越过
+   `window_end + lateness + retention` 后，该窗口的已发布记录被安全遗忘：
+   此后任何该窗口事件必然被水位判为 `LATE_DROPPED`（迟到语义不变），
+   结果也早已恰好一次投递给汇（不丢不重）。
+3. **每源摄取队列**：容量固定（`SourceQueueSize`），背压有界。
+
+修剪在状态协程中随水位推进持续进行，因此内存与每次检查点的落盘体积
+都稳定在与保留范围相称的水平（见 `TestLongRunBoundedState`：300 与
+3000 个窗口两档总量，检查点均为 ~8KB）。
+
+`EmittedRetention = 0`（默认）表示永久保留已发布结果，行为与旧版一致
+（状态随累计窗口数增长），便于兼容既有部署。
+
+**保留策略的恢复语义**：检查点只保留尾部已发布结果，崩溃重启后
+`CommittedFileSink` 只能按保留尾部重建输出文件的末尾部分；更早的结果
+已在崩溃前恰好一次投递，不会重发（不重），也不会因重启而丢失已投递
+事实（不丢）。需要完整重建历史输出的部署应保留 `retention=0`。
+`emit_seq` 跨修剪与恢复保持单调：检查点中的 `next_emit_seq` 在已发布
+记录被修剪后仍记住下一个序号。
+
+> 实现细节：最终排空（所有源 EOF）使用 +inf 哨兵水位，**不**触发修剪，
+> 否则末次检查点会丢掉全部保留尾部，重启时无法重建输出。
+
+## 结果确定性保证
+
+同一批逻辑输入，无论事件来自哪个源、多源并发如何交错、是否有重复
+投递，每个窗口的聚合结果完全一致，重复运行可逐字节对比：
+
+- **串行状态机**：所有窗口/水位/去重状态只在单一状态协程内修改，
+  并发摄入不改变状态更新顺序的语义。
+- **确定的关闭顺序**：窗口按 `(窗口起点, 键)` 排序关闭，`emit_seq`
+  全局单调，与交错无关。
+- **小数值的确定求和**：浮点加法不满足结合律，朴素累加的结果会随
+  到达顺序在末位抖动。引擎为每个打开窗口保存原始值，关闭时先按
+  全序（数值，再按比特位）排序，再做 Neumaier 补偿求和——累加顺序
+  只取决于值的多重集合本身，因此 `Sum` 跨运行**逐比特一致**，且
+  补偿求和压低了舍入误差（见 `deterministicSum` 与
+  `TestDeterministicSumOrderIndependent`）。原始值随检查点落盘，
+  崩溃恢复后继续累加仍然确定。
+- **幂等去重**：重复投递（同窗口同事件 ID）被幂等忽略，不影响结果。
+- **逐字节对比的口径**：`ClosedAt` 是墙钟时间、`Watermark` 取决于
+  到达交错，二者不属于聚合值；对比时请用
+  `key / window_start / count / sum / min / max / first_event_id /
+  emit_seq`（测试中的 `detCanonical` 即此口径，Sum/Min/Max 按比特）。
+
+## 运行状态摘要（体检）
+
+`Engine.Status()` 返回 `StatusSnapshot`，可在摄入进行中从任意
+goroutine 并发读取：不改配置、不中断摄入、只读原子量与队列长度，
+对吞吐的影响可忽略。
+
+| 字段              | 含义                                                     |
+|-------------------|----------------------------------------------------------|
+| `ActiveWindows`   | 当前打开中的窗口数（有界性的直接证据）                   |
+| `WindowsClosed`   | 累计已最终关闭（终结）的窗口数                           |
+| `EmittedRetained` | 当前仍保留的已发布结果数（受 `EmittedRetention` 约束）   |
+| `Ingested` 等     | 摄入/接受/各类异常（MALFORMED、INVALID_TS、OUT_OF_RANGE、LATE_DROPPED、DUPLICATE）与检查点计数 |
+| `GlobalWatermark` | 当前全局水位                                             |
+| `Sources`         | 各源 `Offset`（已消费条数）、`Backlog/QueueCap`（积压）、`Finished`、`Watermark`，按源名排序 |
+
+判断状态是否有界：长跑中 `ActiveWindows` 与 `EmittedRetained` 应稳定在
+由窗口/迟到/保留配置决定的水平附近，不随 `WindowsClosed` 增长。
+定位问题：`Backlog` 持续贴近 `QueueCap` 说明该源被反压；各类异常计数
+对应分类异常表。注意摘要是无锁读取，单条在途记录可造成计数间不超过
+“每源 1 条”的瞬时偏斜，趋势与量级不受影响。
+
+CLI 用 `-status-interval N` 每 N 秒向 stderr 打印一行上述摘要。
+
 ## 检查点：兼容范围与拒绝原因
 
 检查点是一个带魔数、版本与校验和的 JSON 文件：
@@ -90,8 +173,9 @@ cmd/etsr/main.go        本地命令行入口
 magic="ETSR-CKPT", version=1, seq, created_at,
 window_ns, lateness_ns,
 sources: { name: { offset(已消费条数), watermark } },
-window_state: [打开中的窗口及事件ID去重集合],
-emitted:     [已发布窗口结果（用于输出重建与恢复重放）],
+window_state: [打开中的窗口：聚合值、原始事件值（确定求和用）、事件ID去重集合],
+emitted:     [保留尾部内的已发布窗口结果（用于输出重建与恢复重放）],
+next_emit_seq: 下一个发射序号（已发布记录被修剪后仍保持单调）,
 checksum:    以上字段规范 JSON 的 SHA-256 hex
 ```
 
@@ -125,6 +209,8 @@ checksum:    以上字段规范 JSON 的 SHA-256 hex
 | `CheckpointEvery`  | `-every`     | 1000  | 每处理多少条有效事件额外做一次周期检查点          |
 | `MaxOutofOrder`    | `-max-ahead` | 0     | 事件时间相对全局水位的最大超前；0=不限            |
 | `CheckpointPath`   | `-checkpoint`| 无    | 检查点文件路径；提供即启用崩溃恢复                |
+| `EmittedRetention` | `-retention` | 0     | 已发布结果保留秒数（事件时间）；0=永久保留        |
+| —                  | `-status-interval` | 0 | 运行中每 N 秒向 stderr 打印状态摘要；0=不打印     |
 
 其他 CLI：`-inputs a.csv,b.csv`（多源，逗号分隔）、`-out`（JSON Lines 输出）、
 `-errors`（分类异常输出）。
@@ -148,9 +234,15 @@ id,key,2026-01-01T00:00:01Z,1.5
 go build ./...
 go vet ./...
 
-# 全部测试（含并发、乱序迟到、重复、检查点损坏与恢复重放）
+# 全部测试（含并发、乱序迟到、重复、检查点损坏与恢复重放、
+#           长跑有界、顺序无关确定性、运行状态摘要）
 go test ./...
 go test -race -count=5 ./...          # 竞态检测 + 多轮调度压力
+
+# 针对性验证新增能力（日志会打印各场景结论）
+go test ./stream/ -run 'TestLongRun' -v        # 两档窗口总量下状态体积有界 + 保留策略下恢复不重不漏
+go test ./stream/ -run 'Deterministic' -v      # 求和顺序无关 + 交错/重复投递下结果逐比特一致
+go test ./stream/ -run 'TestStatusSnapshot' -v # 运行中读取状态摘要
 
 # CLI：两个本地文件并发摄取
 cat > /tmp/a.csv <<'CSV'
@@ -184,6 +276,36 @@ go run ./cmd/etsr -inputs /tmp/a.csv -checkpoint /tmp/bad.json -out /dev/null
 被分类为 `LATE_DROPPED`，`[00:00,00:01)` 的 `a` 窗口结果保持 `count=3,sum=6`
 不变。
 
+长跑有界性与状态摘要也可以从 CLI 直接观察：
+
+```bash
+# 生成 600 个分钟窗、3 个键的长跑输入
+cat > /tmp/gen.go <<'EOF'
+package main
+
+import ("fmt"; "os"; "time")
+
+func main() {
+	f, _ := os.Create("/tmp/long.csv")
+	defer f.Close()
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	for w := 0; w < 600; w++ {
+		for k := 0; k < 3; k++ {
+			ts := base.Add(time.Duration(w)*time.Minute + time.Duration(k)*time.Second)
+			fmt.Fprintf(f, "w%dk%d,key%d,%s,1.5\n", w, k, k, ts.Format(time.RFC3339))
+		}
+	}
+}
+EOF
+go run /tmp/gen.go
+
+# 保留 120s：检查点体积只与保留尾部相称，不随 600 个窗口的总量增长
+go run ./cmd/etsr -inputs /tmp/long.csv -window 60 -lateness 5 -retention 120 \
+  -checkpoint /tmp/long-ck.json -out /tmp/long-out.jsonl -every 50 -status-interval 1
+ls -l /tmp/long-ck.json     # 只有几 KB；把 600 改成 6000 再跑，体积基本不变
+wc -l /tmp/long-out.jsonl   # 结果不丢不重：600 窗 x 3 键 = 1800 行
+```
+
 ## 测试覆盖一览
 
 - `parse_test.go`：CSV/JSONL 解析、空行注释、各类格式与时间戳错误分类。
@@ -195,5 +317,16 @@ go run ./cmd/etsr -inputs /tmp/a.csv -checkpoint /tmp/bad.json -out /dev/null
   版本不兼容/窗口与迟到配置不一致。
 - `recovery_test.go`：分阶段文件增长+重启与一次性运行结果逐窗口一致、
   `emit_seq` 无重号、损坏检查点拒绝、崩溃发生在提交前时无未提交结果外泄。
+- `longrun_test.go`：两档差 10 倍的累计窗口总量（300/3000 窗）下，
+  运行中轮询 `Status` 验证活跃窗口数与保留尾部有界、最终检查点体积
+  不随总量增长；保留策略下重启只重放有界尾部、`emit_seq` 跨修剪单调、
+  多阶段结果并集与一次性运行逐窗口一致。
+- `determinism_test.go`：求和原语对任意打乱逐比特稳定（含朴素累加
+  随顺序变化的反例对照）；同一逻辑输入在单源顺序/多源交错/重复投递/
+  启用检查点四种形态下，逐窗口聚合结果（含小数 Sum 的比特）完全一致。
+- `status_test.go`：运行中并发读取状态摘要——活跃窗口、各源积压与
+  偏移、分类计数满足一致性不变量，结束后与 `Report` 对齐。
 
-失败用例的日志会打印事件时间、全局水位、检查点版本与具体判定依据。
+失败用例的日志会打印事件时间、全局水位、检查点版本与具体判定依据；
+长跑与确定性用例的日志会打印两档规模的状态体积、保留尾部大小与
+对比结论（`go test -v` 可见）。

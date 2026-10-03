@@ -39,7 +39,10 @@ type Checkpoint struct {
 	Sources    map[string]SourceProgress `json:"sources"`
 	Windows    []windowState             `json:"window_state"`
 	Emitted    []emittedRecord           `json:"emitted"`
-	Checksum   string                    `json:"checksum"`
+	// NextEmitSeq 是下一个发射序号；已发布记录被保留策略修剪后
+	// 仍靠它保持 emit_seq 单调。旧版检查点缺省为 0，按 emitted 回推。
+	NextEmitSeq int64  `json:"next_emit_seq,omitempty"`
+	Checksum    string `json:"checksum"`
 }
 
 // SourceProgress 是单个源在检查点中的进度。
@@ -58,15 +61,16 @@ func checkpointErrorf(kind, path, format string, args ...any) error {
 func buildCheckpoint(seq int64, cfg Config, sources map[string]SourceProgress,
 	windows windowSnapshot) *Checkpoint {
 	c := &Checkpoint{
-		Magic:      checkpointMagic,
-		Version:    CheckpointVersion,
-		Seq:        seq,
-		CreatedAt:  time.Now().UTC(),
-		WindowNS:   cfg.WindowSize.Nanoseconds(),
-		LatenessNS: cfg.AllowedLateness.Nanoseconds(),
-		Sources:    sources,
-		Windows:    windows.Open,
-		Emitted:    windows.Emitted,
+		Magic:       checkpointMagic,
+		Version:     CheckpointVersion,
+		Seq:         seq,
+		CreatedAt:   time.Now().UTC(),
+		WindowNS:    cfg.WindowSize.Nanoseconds(),
+		LatenessNS:  cfg.AllowedLateness.Nanoseconds(),
+		Sources:     sources,
+		Windows:     windows.Open,
+		Emitted:     windows.Emitted,
+		NextEmitSeq: windows.NextEmitSeq,
 	}
 	c.Checksum = computeChecksum(c)
 	return c
