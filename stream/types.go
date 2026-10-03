@@ -83,6 +83,17 @@ type Config struct {
 	MaxOutofOrder   time.Duration
 	CheckpointPath  string
 	CheckpointEvery int64
+	// EmittedRetention 是已发布窗口结果在状态与检查点中的保留范围：
+	// 当全局水位越过 windowEnd+AllowedLateness+EmittedRetention 后，
+	// 该窗口的已发布记录被安全遗忘（此后任何该窗口事件必然迟到，
+	// 由水位视界判定，不依赖保留记录）。这使长跑场景下内存与
+	// 检查点体积只与活跃窗口、迟到视界与保留范围相关，而不随
+	// 累计窗口数膨胀。<=0 表示不保留（关闭视界一过即遗忘）。
+	EmittedRetention time.Duration
+	// DeterministicClosedAt 为 true 时，结果的 ClosedAt 取窗口关闭视界
+	// （windowEnd+AllowedLateness）而非墙钟时间，使同一批逻辑输入
+	// 重复运行的输出可逐字节对比。
+	DeterministicClosedAt bool
 }
 
 // DefaultConfig 返回一组可用的默认配置。
@@ -93,8 +104,11 @@ func DefaultConfig() Config {
 		SourceQueueSize: 1024,
 		// MaxOutofOrder 对“事件时间相对当前水位超前过多”的异常事件设界。
 		// 0 表示不限制（默认关闭此项检查，乱序只受迟到语义约束）。
-		MaxOutofOrder:   0,
-		CheckpointEvery: 1000,
+		MaxOutofOrder: 0,
+		// EmittedRetention 默认保留 1 小时：足以覆盖恢复重放与运行中观测，
+		// 同时保证长跑时状态有界。
+		EmittedRetention: time.Hour,
+		CheckpointEvery:  1000,
 	}
 }
 

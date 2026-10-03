@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -28,6 +29,9 @@ func main() {
 		queueSize = flag.Int("queue", 1024, "每源有界摄取队列容量（背压粒度）")
 		every     = flag.Int("every", 1000, "每处理多少条有效事件做一次检查点")
 		maxAhead  = flag.Int("max-ahead", 0, "事件时间相对全局水位最大超前秒数，超出判 OUT_OF_RANGE；0=不限制")
+		retention = flag.Int("retention", 3600, "已发布结果在关闭视界之后的保留秒数（状态/检查点有界范围）；0=关闭即遗忘")
+		determ    = flag.Bool("deterministic", false, "确定性输出：ClosedAt 取关闭水位而非墙钟，重复运行输出可逐字节对比")
+		statusSec = flag.Int("status-interval", 0, "运行中每隔多少秒向 stderr 打印一次状态摘要(JSON)；0=关闭")
 		errLog    = flag.String("errors", "", "分类异常输出文件（JSON Lines 风格文本），默认 stderr")
 	)
 	flag.Parse()
@@ -59,6 +63,8 @@ func main() {
 	if *maxAhead > 0 {
 		cfg.MaxOutofOrder = time.Duration(*maxAhead) * time.Second
 	}
+	cfg.EmittedRetention = time.Duration(*retention) * time.Second
+	cfg.DeterministicClosedAt = *determ
 
 	paths := strings.Split(*inputs, ",")
 	var sources []stream.Source
@@ -109,6 +115,26 @@ func main() {
 
 	eng := stream.NewEngine(cfg, onError)
 
+	// 运行中状态体检：周期打印 Status 摘要（只读，不影响摄入）。
+	var statusDone chan struct{}
+	if *statusSec > 0 {
+		statusDone = make(chan struct{})
+		go func() {
+			tick := time.NewTicker(time.Duration(*statusSec) * time.Second)
+			defer tick.Stop()
+			for {
+				select {
+				case <-statusDone:
+					return
+				case <-tick.C:
+					if data, err := json.Marshal(eng.Status()); err == nil {
+						fmt.Fprintf(os.Stderr, "status: %s\n", data)
+					}
+				}
+			}
+		}()
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -121,6 +147,9 @@ func main() {
 		}
 		fmt.Fprintf(os.Stderr, "engine run failed: %v\n", err)
 		os.Exit(1)
+	}
+	if statusDone != nil {
+		close(statusDone)
 	}
 
 	st := eng.Report()

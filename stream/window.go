@@ -10,7 +10,8 @@ type openWindow struct {
 	key            string
 	start, end     time.Time
 	count          int64
-	sum, min, max  float64
+	sum            exactSum // 精确和：顺序无关，任意到达顺序结果逐位一致
+	min, max       float64
 	firstEventID   string
 	firstEventTime time.Time
 	seenIDs        map[string]struct{}
@@ -23,14 +24,18 @@ type emittedEntry struct {
 
 // WindowStore 保存有界窗口状态：
 //   - open：打开中的窗口（数量受水位推进与允许的未来范围上界约束）；
-//   - emitted：已发布窗口（仅保留水位迟到视界以内的尾部，视界之外的任何
-//     事件无论如何都会被判迟到，因此可以安全遗忘）。
+//   - emitted：已发布窗口（仅保留 关闭视界+保留范围 以内的尾部；
+//     全局水位越过 windowEnd+lateness+retention 后，该窗口的任何后续事件
+//     都必然被水位视界判为迟到，因此保留记录可以安全遗忘——状态体积只与
+//     活跃窗口、迟到视界和配置的保留范围相关，不随累计窗口数膨胀）。
 type WindowStore struct {
 	windowSize time.Duration
 	lateness   time.Duration
+	retention  time.Duration // 已发布结果在关闭视界之后的保留范围
 	open       map[WindowID]*openWindow
 	emitted    map[WindowID]emittedEntry
 	emittedOrd []WindowID // 按发射顺序
+	nextSeq    int64      // 下一个发射序号（持久化，遗忘已发布记录后仍单调）
 }
 
 func NewWindowStore(windowSize, allowedLateness time.Duration) *WindowStore {
@@ -39,7 +44,16 @@ func NewWindowStore(windowSize, allowedLateness time.Duration) *WindowStore {
 		lateness:   allowedLateness,
 		open:       make(map[WindowID]*openWindow),
 		emitted:    make(map[WindowID]emittedEntry),
+		nextSeq:    1,
 	}
+}
+
+// SetEmittedRetention 设置已发布结果在关闭视界之后的保留范围。
+func (s *WindowStore) SetEmittedRetention(d time.Duration) {
+	if d < 0 {
+		d = 0
+	}
+	s.retention = d
 }
 
 // closedHorizon 返回窗口的关闭视界：全局水位到达 end+lateness 时窗口最终关闭。
@@ -68,6 +82,7 @@ func (s *WindowStore) Add(e *Event, watermark time.Time) (accepted, dropped, dup
 	if w == nil {
 		w = &openWindow{
 			key: e.Key, start: start, end: end,
+			sum: newExactSum(),
 			min: e.Value, max: e.Value,
 			firstEventID: e.ID, firstEventTime: e.Timestamp,
 			seenIDs: make(map[string]struct{}),
@@ -81,7 +96,7 @@ func (s *WindowStore) Add(e *Event, watermark time.Time) (accepted, dropped, dup
 
 	w.seenIDs[e.ID] = struct{}{}
 	w.count++
-	w.sum += e.Value
+	w.sum.Add(e.Value)
 	if e.Value < w.min {
 		w.min = e.Value
 	}
@@ -135,7 +150,7 @@ func (s *WindowStore) Close(id WindowID, wm, closedAt time.Time, seq int64) (*Wi
 		WindowStart:  w.start,
 		WindowEnd:    w.end,
 		Count:        w.count,
-		Sum:          w.sum,
+		Sum:          w.sum.Float(),
 		Min:          w.min,
 		Max:          w.max,
 		FirstEventID: w.firstEventID,
@@ -145,6 +160,9 @@ func (s *WindowStore) Close(id WindowID, wm, closedAt time.Time, seq int64) (*Wi
 	}
 	s.emitted[id] = emittedEntry{R: *r}
 	s.emittedOrd = append(s.emittedOrd, id)
+	if seq >= s.nextSeq {
+		s.nextSeq = seq + 1 // 发射序号随关闭单调推进，并随快照持久化
+	}
 	return r, true
 }
 
@@ -165,21 +183,51 @@ func (s *WindowStore) EmittedResults() []WindowResult {
 	return out
 }
 
-// NextSeq 给出恢复后下一个发射序号。
+// OpenCount 返回当前打开中的窗口数（运行状态摘要用）。
+func (s *WindowStore) OpenCount() int { return len(s.open) }
+
+// EmittedCount 返回仍在保留范围内的已发布窗口数（运行状态摘要用）。
+func (s *WindowStore) EmittedCount() int { return len(s.emitted) }
+
+// NextSeq 给出恢复后下一个发射序号。序号随快照持久化，
+// 即使旧的已发布记录已按保留范围被遗忘，序号也不会回退重用。
 func (s *WindowStore) NextSeq() int64 {
-	var max int64
-	for _, en := range s.emitted {
-		if en.R.EmitSeq > max {
-			max = en.R.EmitSeq
-		}
+	return s.nextSeq
+}
+
+// forgetHorizon 返回已发布记录的遗忘视界：全局水位越过
+// windowEnd+lateness+retention 的已发布窗口可以被安全遗忘。
+func (s *WindowStore) forgetHorizon(end time.Time) time.Time {
+	return end.Add(s.lateness + s.retention)
+}
+
+// PruneEmitted 遗忘遗忘视界已越过 before 的已发布记录，返回遗忘条数。
+// before 为零值时不做任何事。迟到判定不依赖这些记录（水位视界已保证
+// 任何该窗口事件必然被判迟到），因此遗忘不改变迟到语义。
+func (s *WindowStore) PruneEmitted(before time.Time) int {
+	if before.IsZero() {
+		return 0
 	}
-	return max + 1
+	pruned := 0
+	kept := s.emittedOrd[:0]
+	for _, id := range s.emittedOrd {
+		en := s.emitted[id]
+		if !before.Before(s.forgetHorizon(en.R.WindowEnd)) {
+			delete(s.emitted, id)
+			pruned++
+			continue
+		}
+		kept = append(kept, id)
+	}
+	s.emittedOrd = kept
+	return pruned
 }
 
 // windowSnapshot 是窗口状态的可序列化快照。
 type windowSnapshot struct {
 	Open    []windowState
 	Emitted []emittedRecord
+	NextSeq int64
 }
 
 // windowState 是 openWindow 的序列化载体。
@@ -189,6 +237,7 @@ type windowState struct {
 	End            time.Time `json:"end"`
 	Count          int64     `json:"count"`
 	Sum            float64   `json:"sum"`
+	SumExact       string    `json:"sum_exact,omitempty"` // 精确和（有理数文本），恢复后累加仍顺序无关
 	Min            float64   `json:"min"`
 	Max            float64   `json:"max"`
 	FirstEventID   string    `json:"first_event_id"`
@@ -201,12 +250,13 @@ type emittedRecord struct {
 	R WindowResult `json:"result"`
 }
 
-// Snapshot 导出状态；pruneBefore 给定水位时，遗忘关闭视界已越过该水位的
-// 已发布窗口（迟到视界之外，任何后续事件都必然被判迟到）。
+// Snapshot 导出状态；pruneBefore 给定水位时，遗忘遗忘视界
+// （windowEnd+lateness+retention）已越过该水位的已发布窗口。
 func (s *WindowStore) Snapshot(pruneBefore time.Time) windowSnapshot {
 	snap := windowSnapshot{
 		Open:    make([]windowState, 0, len(s.open)),
 		Emitted: make([]emittedRecord, 0, len(s.emittedOrd)),
+		NextSeq: s.nextSeq,
 	}
 	for _, w := range s.open {
 		ids := make([]string, 0, len(w.seenIDs))
@@ -216,23 +266,16 @@ func (s *WindowStore) Snapshot(pruneBefore time.Time) windowSnapshot {
 		sort.Strings(ids) // 序列化确定性
 		snap.Open = append(snap.Open, windowState{
 			Key: w.key, Start: w.start, End: w.end,
-			Count: w.count, Sum: w.sum, Min: w.min, Max: w.max,
+			Count: w.count, Sum: w.sum.Float(), SumExact: w.sum.String(),
+			Min: w.min, Max: w.max,
 			FirstEventID: w.firstEventID, FirstEventTime: w.firstEventTime,
 			SeenIDs: ids,
 		})
 	}
-	keptOrd := s.emittedOrd[:0]
+	s.PruneEmitted(pruneBefore) // 顺带收紧内存中的已发布尾部
 	for _, id := range s.emittedOrd {
-		en := s.emitted[id]
-		if !pruneBefore.IsZero() &&
-			!pruneBefore.Before(windowClosedHorizon(en.R.WindowEnd, s.lateness)) {
-			delete(s.emitted, id)
-			continue
-		}
-		snap.Emitted = append(snap.Emitted, emittedRecord{R: en.R})
-		keptOrd = append(keptOrd, id)
+		snap.Emitted = append(snap.Emitted, emittedRecord{R: s.emitted[id].R})
 	}
-	s.emittedOrd = keptOrd
 	sort.Slice(snap.Open, func(i, j int) bool {
 		if !snap.Open[i].Start.Equal(snap.Open[j].Start) {
 			return snap.Open[i].Start.Before(snap.Open[j].Start)
@@ -250,19 +293,41 @@ func (s *WindowStore) Restore(snap windowSnapshot) {
 		for _, id := range st.SeenIDs {
 			seen[id] = struct{}{}
 		}
+		sum := newExactSum()
+		if st.SumExact != "" {
+			if !sum.setString(st.SumExact) {
+				// 快照由本包写出且经校验和保护，非法即编程错误。
+				panic("stream: invalid exact sum in snapshot: " + st.SumExact)
+			}
+		} else {
+			sum.Add(st.Sum) // 兼容无精确和字段的旧快照
+		}
 		s.open[WindowID{Key: st.Key, Start: st.Start}] = &openWindow{
 			key: st.Key, start: st.Start, end: st.End,
-			count: st.Count, sum: st.Sum, min: st.Min, max: st.Max,
+			count: st.Count, sum: sum, min: st.Min, max: st.Max,
 			firstEventID: st.FirstEventID, firstEventTime: st.FirstEventTime,
 			seenIDs: seen,
 		}
 	}
 	s.emitted = make(map[WindowID]emittedEntry, len(snap.Emitted))
 	s.emittedOrd = s.emittedOrd[:0]
+	var maxSeq int64
 	for _, er := range snap.Emitted {
 		id := WindowID{Key: er.R.Key, Start: er.R.WindowStart}
 		s.emitted[id] = emittedEntry{R: er.R}
 		s.emittedOrd = append(s.emittedOrd, id)
+		if er.R.EmitSeq > maxSeq {
+			maxSeq = er.R.EmitSeq
+		}
+	}
+	// 恢复发射序号：优先取快照中的持久化值；旧快照没有该字段时
+	// 退化为已保留记录中的最大值+1（序号绝不回退重用）。
+	s.nextSeq = snap.NextSeq
+	if s.nextSeq < maxSeq+1 {
+		s.nextSeq = maxSeq + 1
+	}
+	if s.nextSeq <= 0 {
+		s.nextSeq = 1
 	}
 }
 

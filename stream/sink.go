@@ -1,6 +1,7 @@
 package stream
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -92,27 +93,68 @@ var _ Sink = (*JSONSink)(nil)
 var _ Sink = (*MemorySink)(nil)
 
 // CommittedFileSink 是与检查点协议配套的本地文件汇：
-//   - 启动时以 O_TRUNC 打开（旧文件由检查点中的已提交结果完整重建）；
+//   - 启动时以追加模式打开，并扫描已有内容建立“已写入窗口”集合
+//     （崩溃半截的最后一行会被截掉，保证文件始终是合法 JSON Lines）；
 //   - 引擎仅在检查点提交成功后才把新结果追加进来并 fsync；
-//   - 崩溃恢复时引擎重放检查点中的全部已发布结果，因此最终文件与
-//     “已提交状态”严格一致：不重、不漏、无未提交结果。
+//   - 恢复重放时，已在文件中的窗口被幂等跳过，未写入的补齐。
+//
+// 因此输出文件始终等于“已提交结果的全集”：不重、不漏、无未提交结果——
+// 即使检查点中的已发布记录已按保留范围被遗忘（长跑下有界状态），
+// 文件中的历史结果也不会丢失。
 type CommittedFileSink struct {
-	mu sync.Mutex
-	f  *os.File
+	mu   sync.Mutex
+	f    *os.File
+	seen map[string]struct{}
 }
 
-// NewCommittedFileSink 截断打开 path。调用方一般在 Run 开始时构造一次。
+// NewCommittedFileSink 以追加模式打开 path 并扫描已有结果用于去重。
+// 调用方一般在 Run 开始时构造一次。
 func NewCommittedFileSink(path string) (*CommittedFileSink, error) {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return nil, err
 	}
-	return &CommittedFileSink{f: f}, nil
+	s := &CommittedFileSink{f: f, seen: make(map[string]struct{})}
+	if err := s.rescan(); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	return s, nil
+}
+
+// rescan 读取已有内容，登记已写入的窗口，并把文件截断到最后一条
+// 完整记录之后（清除崩溃可能留下的半行），随后定位到末尾准备追加。
+func (s *CommittedFileSink) rescan() error {
+	if _, err := s.f.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	sc := bufio.NewScanner(s.f)
+	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	var validEnd int64
+	for sc.Scan() {
+		line := sc.Bytes()
+		var r WindowResult
+		if err := json.Unmarshal(line, &r); err != nil {
+			// 半截/损坏行：停止扫描并在此处截断。
+			break
+		}
+		s.seen[resultKey(&r)] = struct{}{}
+		validEnd += int64(len(line)) + 1 // + '\n'
+	}
+	if err := s.f.Truncate(validEnd); err != nil {
+		return err
+	}
+	_, err := s.f.Seek(validEnd, io.SeekStart)
+	return err
 }
 
 func (s *CommittedFileSink) Emit(r *WindowResult) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	k := resultKey(r)
+	if _, dup := s.seen[k]; dup {
+		return nil // 恢复重放/重复发布：幂等跳过，文件内恰好一次
+	}
 	data, err := json.Marshal(r)
 	if err != nil {
 		return err
@@ -120,7 +162,11 @@ func (s *CommittedFileSink) Emit(r *WindowResult) error {
 	if _, err := s.f.Write(append(data, '\n')); err != nil {
 		return err
 	}
-	return s.f.Sync()
+	if err := s.f.Sync(); err != nil {
+		return err
+	}
+	s.seen[k] = struct{}{}
+	return nil
 }
 
 func (s *CommittedFileSink) Close() error {

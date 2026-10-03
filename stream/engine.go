@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"sync/atomic"
 	"time"
 )
 
@@ -31,6 +32,10 @@ type Engine struct {
 	onError ErrorHandler
 	stats   Stats
 	emitSeq int64
+	// live 暴露运行中状态（Status 读取）；cur 仅供状态协程无锁更新。
+	// 两者指向同一对象；live 用 atomic.Pointer 保证并发发布安全。
+	live atomic.Pointer[engineLive]
+	cur  *engineLive
 }
 
 // NewEngine 创建引擎。onError 用于观测所有分类异常；为 nil 时异常仅计数。
@@ -74,6 +79,7 @@ func (e *Engine) Run(ctx context.Context, sources []Source, sink Sink) (retErr e
 	e.stats = Stats{}
 
 	store := NewWindowStore(e.cfg.WindowSize, e.cfg.AllowedLateness)
+	store.SetEmittedRetention(e.cfg.EmittedRetention)
 	tracker := NewWatermarkTracker()
 	for _, src := range sources {
 		tracker.Register(src.Name())
@@ -94,7 +100,9 @@ func (e *Engine) Run(ctx context.Context, sources []Source, sink Sink) (retErr e
 			if err := checkSourceSet(ck, sources); err != nil {
 				return err
 			}
-			store.Restore(windowSnapshot{Open: ck.Windows, Emitted: ck.Emitted})
+			store.Restore(windowSnapshot{
+				Open: ck.Windows, Emitted: ck.Emitted, NextSeq: ck.NextEmitSeq,
+			})
 			for name, p := range ck.Sources {
 				tracker.Restore(name, p.Watermark)
 			}
@@ -189,8 +197,36 @@ func (e *Engine) Run(ctx context.Context, sources []Source, sink Sink) (retErr e
 		}
 	}
 
+	// 运行中可观测状态：全部原子量，Status 可无锁并发读取。
+	lv := &engineLive{srcIdx: make(map[string]int, len(order))}
+	lv.sources = make([]sourceLive, len(order))
+	for i, name := range order {
+		lv.sources[i].name = name
+		lv.sources[i].ch = queues[name]
+		lv.sources[i].offset.Store(offsets[name])
+		lv.srcIdx[name] = i
+	}
+	for name, wm := range tracker.PerSource() {
+		if idx, ok := lv.srcIdx[name]; ok {
+			lv.sources[idx].wmNano.Store(timeToNano(wm))
+		}
+	}
+	lv.running.Store(true)
+	defer lv.running.Store(false)
+	e.cur = lv
+	e.live.Store(lv)
+	refreshCounts := func() {
+		lv.activeWindows.Store(int64(store.OpenCount()))
+		lv.retainedEmitted.Store(int64(store.EmittedCount()))
+	}
+	refreshCounts()
+
 	var pending []*WindowResult // 已关闭、等待提交后发布的窗口
 	sinceCkpt := int64(0)
+	// pruneWM 是最近一次真实观测到的全局水位（不含 EOI 哨兵）。
+	// 已发布尾部的遗忘只跟随真实事件时间进度：EOI 哨兵是逻辑 +inf，
+	// 若用它剪枝会把重启重放所需的已提交结果也一并遗忘。
+	var pruneWM time.Time
 
 	checkpointAndPublish := func() error {
 		if e.cfg.CheckpointPath == "" {
@@ -202,6 +238,7 @@ func (e *Engine) Run(ctx context.Context, sources []Source, sink Sink) (retErr e
 				e.stats.WindowsEmitted++
 			}
 			pending = pending[:0]
+			lv.windowsEmitted.Store(e.stats.WindowsEmitted)
 			return nil
 		}
 		wms := tracker.PerSource()
@@ -213,7 +250,9 @@ func (e *Engine) Run(ctx context.Context, sources []Source, sink Sink) (retErr e
 		if lastCkpt != nil {
 			seq = lastCkpt.Seq
 		}
-		snap := store.Snapshot(time.Time{}) // 保留全部已提交结果用于输出重建
+		// 按真实水位剪枝已发布尾部：检查点体积只与活跃窗口、
+		// 迟到视界和保留范围相关，不随累计窗口数膨胀。
+		snap := store.Snapshot(pruneWM)
 		ck := buildCheckpoint(seq+1, e.cfg, sp, snap)
 		if err := SaveCheckpoint(e.cfg.CheckpointPath, ck); err != nil {
 			return err
@@ -229,12 +268,21 @@ func (e *Engine) Run(ctx context.Context, sources []Source, sink Sink) (retErr e
 		}
 		pending = pending[:0]
 		sinceCkpt = 0
+		lv.checkpoints.Store(e.stats.Checkpoints)
+		lv.windowsEmitted.Store(e.stats.WindowsEmitted)
+		refreshCounts() // 快照可能剪枝了已发布尾部
 		return nil
 	}
 
 	closeReady := func(wm time.Time) error {
 		for _, id := range store.Closeable(wm) {
-			r, ok := store.Close(id, wm, time.Now().UTC(), e.emitSeq)
+			closedAt := time.Now().UTC()
+			if e.cfg.DeterministicClosedAt {
+				// 确定性模式：ClosedAt 取窗口关闭视界（windowEnd+lateness）
+				// 而非墙钟，同一批逻辑输入重复运行的输出可逐字节对比。
+				closedAt = id.Start.Add(e.cfg.WindowSize + e.cfg.AllowedLateness).UTC()
+			}
+			r, ok := store.Close(id, wm, closedAt, e.emitSeq)
 			if !ok {
 				continue
 			}
@@ -291,11 +339,15 @@ func (e *Engine) Run(ctx context.Context, sources []Source, sink Sink) (retErr e
 				e.processItem(it, store, tracker, offsets)
 			})
 			tracker.Finish(name)
+			lv.sources[lv.srcIdx[name]].finished.Store(true)
 			delete(active, name)
 			gwm := tracker.Global()
+			pruneWM = gwm
+			lv.globalWMNano.Store(timeToNano(gwm))
 			if err := closeReady(gwm); err != nil {
 				return err
 			}
+			refreshCounts()
 			if len(pending) > 0 {
 				if err := checkpointAndPublish(); err != nil {
 					return err
@@ -313,9 +365,17 @@ func (e *Engine) Run(ctx context.Context, sources []Source, sink Sink) (retErr e
 		}
 
 		gwm := tracker.Global()
+		pruneWM = gwm
+		lv.globalWMNano.Store(timeToNano(gwm))
 		if err := closeReady(gwm); err != nil {
 			return err
 		}
+		if e.cfg.CheckpointPath == "" {
+			// 无检查点时快照不会运行，这里直接收紧内存中的已发布尾部，
+			// 保证长跑下内存同样有界。
+			store.PruneEmitted(pruneWM)
+		}
+		refreshCounts()
 		// 一旦有窗口被水位关闭：立即提交并发布（提交成功后才对外可见）；
 		// 否则按固定事件数周期做检查点。
 		if len(pending) > 0 || sinceCkpt >= e.cfg.CheckpointEvery {
@@ -333,6 +393,7 @@ func (e *Engine) Run(ctx context.Context, sources []Source, sink Sink) (retErr e
 	if err := checkpointAndPublish(); err != nil {
 		return err
 	}
+	refreshCounts()
 	return nil
 }
 
@@ -350,11 +411,15 @@ func drainRemaining(ch chan ingestionItem, fn func(ingestionItem)) {
 // processItem 处理一条摄取记录（仅在状态 goroutine 中调用）。
 func (e *Engine) processItem(it ingestionItem, store *WindowStore,
 	tracker *WatermarkTracker, offsets map[string]int64) {
+	lv := e.cur
+	src := &lv.sources[lv.srcIdx[it.source]]
 	// 偏移按物理记录推进，空行/注释/坏记录也不例外，保证恢复不重不漏。
 	if it.offset >= offsets[it.source] {
 		offsets[it.source] = it.offset + 1
+		src.offset.Store(offsets[it.source])
 	}
 	e.stats.Ingested++
+	lv.ingested.Add(1)
 
 	if it.event == nil && it.perr != nil {
 		it.perr.Watermark = tracker.Global()
@@ -362,8 +427,10 @@ func (e *Engine) processItem(it ingestionItem, store *WindowStore,
 		switch it.perr.Kind {
 		case KindMalformed:
 			e.stats.Malformed++
+			lv.malformed.Add(1)
 		case KindInvalidTimestamp:
 			e.stats.InvalidTS++
+			lv.invalidTS.Add(1)
 		}
 		return
 	}
@@ -383,11 +450,15 @@ func (e *Engine) processItem(it ingestionItem, store *WindowStore,
 		ce.Watermark = gwm
 		e.reportError(ce)
 		e.stats.OutOfRange++
+		lv.outOfRange.Add(1)
 		return
 	}
 
 	// 先观测水位再入窗：以最新水位判定窗口是否已关闭，语义最严格。
-	newWM, _ := tracker.Observe(ev.Source, ev.Timestamp)
+	newWM, advanced := tracker.Observe(ev.Source, ev.Timestamp)
+	if advanced {
+		src.wmNano.Store(timeToNano(ev.Timestamp))
+	}
 	accepted, dropped, dup := store.Add(ev, newWM)
 	switch {
 	case dup:
@@ -397,6 +468,7 @@ func (e *Engine) processItem(it ingestionItem, store *WindowStore,
 		ce.Watermark = newWM
 		e.reportError(ce)
 		e.stats.Duplicates++
+		lv.duplicates.Add(1)
 	case dropped:
 		start := WindowStart(ev.Timestamp, e.cfg.WindowSize)
 		ce := classify(KindLateDropped, ev.Source, ev.Offset, it.raw, ev.Timestamp,
@@ -408,8 +480,11 @@ func (e *Engine) processItem(it ingestionItem, store *WindowStore,
 		ce.Watermark = newWM
 		e.reportError(ce)
 		e.stats.LateDropped++
+		lv.lateDropped.Add(1)
 	case accepted:
 		e.stats.Accepted++
+		lv.accepted.Add(1)
+		lv.activeWindows.Store(int64(store.OpenCount()))
 	}
 }
 

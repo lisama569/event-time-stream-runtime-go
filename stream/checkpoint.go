@@ -14,7 +14,9 @@ import (
 
 const (
 	// CheckpointVersion 是当前二进制支持的检查点格式版本。
-	CheckpointVersion = 1
+	// v2：新增 next_emit_seq（发射序号持久化，已发布记录按保留范围
+	// 遗忘后序号仍单调）与 window_state 的 sum_exact（精确和）。
+	CheckpointVersion = 2
 	checkpointMagic   = "ETSR-CKPT"
 )
 
@@ -30,16 +32,17 @@ const (
 // Checkpoint 是一次一致性快照：各源偏移量与水位、窗口状态、已发射结果。
 // Checksum 为除自身外全部字段的规范 JSON 的 SHA-256（hex）。
 type Checkpoint struct {
-	Magic      string                    `json:"magic"`
-	Version    int                       `json:"version"`
-	Seq        int64                     `json:"seq"`
-	CreatedAt  time.Time                 `json:"created_at"`
-	WindowNS   int64                     `json:"window_ns"`
-	LatenessNS int64                     `json:"lateness_ns"`
-	Sources    map[string]SourceProgress `json:"sources"`
-	Windows    []windowState             `json:"window_state"`
-	Emitted    []emittedRecord           `json:"emitted"`
-	Checksum   string                    `json:"checksum"`
+	Magic       string                    `json:"magic"`
+	Version     int                       `json:"version"`
+	Seq         int64                     `json:"seq"`
+	CreatedAt   time.Time                 `json:"created_at"`
+	WindowNS    int64                     `json:"window_ns"`
+	LatenessNS  int64                     `json:"lateness_ns"`
+	NextEmitSeq int64                     `json:"next_emit_seq"`
+	Sources     map[string]SourceProgress `json:"sources"`
+	Windows     []windowState             `json:"window_state"`
+	Emitted     []emittedRecord           `json:"emitted"`
+	Checksum    string                    `json:"checksum"`
 }
 
 // SourceProgress 是单个源在检查点中的进度。
@@ -58,15 +61,16 @@ func checkpointErrorf(kind, path, format string, args ...any) error {
 func buildCheckpoint(seq int64, cfg Config, sources map[string]SourceProgress,
 	windows windowSnapshot) *Checkpoint {
 	c := &Checkpoint{
-		Magic:      checkpointMagic,
-		Version:    CheckpointVersion,
-		Seq:        seq,
-		CreatedAt:  time.Now().UTC(),
-		WindowNS:   cfg.WindowSize.Nanoseconds(),
-		LatenessNS: cfg.AllowedLateness.Nanoseconds(),
-		Sources:    sources,
-		Windows:    windows.Open,
-		Emitted:    windows.Emitted,
+		Magic:       checkpointMagic,
+		Version:     CheckpointVersion,
+		Seq:         seq,
+		CreatedAt:   time.Now().UTC(),
+		WindowNS:    cfg.WindowSize.Nanoseconds(),
+		LatenessNS:  cfg.AllowedLateness.Nanoseconds(),
+		NextEmitSeq: windows.NextSeq,
+		Sources:     sources,
+		Windows:     windows.Open,
+		Emitted:     windows.Emitted,
 	}
 	c.Checksum = computeChecksum(c)
 	return c
