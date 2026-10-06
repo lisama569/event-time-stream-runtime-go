@@ -14,10 +14,12 @@
   关闭顺序按 `(窗口起点, 键)` 固定，发射序号 `emit_seq` 全局单调。
 - 一致性检查点：原子写（tmp + fsync + rename）、SHA-256 校验和、
   版本号魔数与窗口配置校验；损坏/缺失/版本不兼容/配置不一致均以**可区分原因**拒绝。
-- 提交后发布：窗口结果只在其所属状态成功落盘检查点后才写入输出；
-  恢复时先按 `emit_seq` 确定序重放全部已提交结果，再处理新事件。
-- 长跑有界状态：`EmittedRetention` 限定已发布结果的保留范围，
-  内存与检查点体积只取决于活跃窗口与保留尾部，与累计窗口总量无关。
+- 提交后发布：窗口结果只在其所属状态成功落盘检查点后才**追加**写入输出；
+  输出文件是只增不改的完整历史，恢复时按 `emit_seq` 对账（保留完整行、
+  剥掉崩溃半行、前缀去重、缺失补写），有限保留下重启也不丢不重。
+- 长跑有界状态：`EmittedRetention` 限定**内存与检查点**中已发布结果的
+  保留范围，有界的只是状态而非输出；内存与检查点体积只取决于活跃窗口
+  与保留尾部，与累计窗口总量无关，输出文件始终保留全部已产出窗口。
 - 结果确定：同一逻辑输入与到达顺序、源交错、重复投递无关；
   小数值按确定顺序补偿求和，跨运行逐比特一致。
 - 运行状态摘要：`Engine.Status()` 在摄入进行中并发读取活跃窗口数、
@@ -33,7 +35,7 @@ stream/                 库包
   watermark.go          每源水位与全局最小水位
   window.go             键控窗口、确定性聚合、迟到判定、去重、快照
   checkpoint.go         版本化检查点、校验和、原子写、分类拒绝
-  sink.go               JSONSink / MemorySink / CommittedFileSink
+  sink.go               JSONSink / MemorySink / CommittedFileSink（追加式对账恢复）
   engine.go             并发摄取编排、背压、提交-发布协议
   *_test.go             全部语义与恢复测试
 cmd/etsr/main.go        本地命令行入口
@@ -108,17 +110,36 @@ cmd/etsr/main.go        本地命令行入口
 3000 个窗口两档总量，检查点均为 ~8KB）。
 
 `EmittedRetention = 0`（默认）表示永久保留已发布结果，行为与旧版一致
-（状态随累计窗口数增长），便于兼容既有部署。
+（内存状态随累计窗口数增长，但检查点仍可用于恢复）；长跑部署建议设为非 0。
 
-**保留策略的恢复语义**：检查点只保留尾部已发布结果，崩溃重启后
-`CommittedFileSink` 只能按保留尾部重建输出文件的末尾部分；更早的结果
-已在崩溃前恰好一次投递，不会重发（不重），也不会因重启而丢失已投递
-事实（不丢）。需要完整重建历史输出的部署应保留 `retention=0`。
+**保留策略与输出重建（重启后历史结果一条不少）**：有限的是**内存与检查点**，
+不是输出。`-out` 指定的输出文件是一份**只增不改的完整结果历史**：
+
+- 结果只在其所属状态成功进入检查点**之后**才追加写入输出文件（一次
+  `write` 写完整一行并 `fsync`）；修剪只会把结果从内存/检查点遗忘，
+  而能被修剪的结果在此前提交时必然已经完整落进输出文件，因此历史不丢。
+- 重启时输出文件**不再被截断重写**。引擎先加载检查点，随后让
+  `CommittedFileSink` 对输出文件做一次流式恢复对账（只读缓冲为常数大小，
+  不把历史读入内存）：
+  1. 逐行校验，确认完整行是合法结果、`emit_seq` 从 1 起**严格连续无重号**；
+  2. 记录已完整持久化的最大 `emit_seq`（已持久化前缀）；
+  3. 把文件末尾最后一个换行符之后的内容视为**崩溃半行**并剥除；
+  4. 检查点保留尾部按 `emit_seq` 重放时，凡已在前缀内的结果一律跳过
+     （不重），缺失的（含被剥掉半行的那个窗口、以及提交后尚未写完的
+     窗口）按原序号补写（不漏），之后新结果继续追加。
+- 因此无论保留范围多小、重启多少次（输入不变或只追加），输出文件始终
+  包含**所有**已产出窗口，每个窗口恰好一行；内存占用与每次落盘的检查点
+  体积仍只取决于活跃窗口、等待迟到的保留数据与保留范围。
+- 若输出文件的**完整行**损坏或 `emit_seq` 出现断档（文件被外部截断或与
+  别的运行混用），引擎以明确错误拒绝启动，而不会基于错误的前缀静默丢结果；
+  无检查点的全新启动会截断旧输出从头开始。
+
 `emit_seq` 跨修剪与恢复保持单调：检查点中的 `next_emit_seq` 在已发布
 记录被修剪后仍记住下一个序号。
 
 > 实现细节：最终排空（所有源 EOF）使用 +inf 哨兵水位，**不**触发修剪，
-> 否则末次检查点会丢掉全部保留尾部，重启时无法重建输出。
+> 否则末次检查点会丢掉全部保留尾部，崩溃于末次提交之后时无法补写尾部；
+> 更早的结果则始终由输出文件自身承载，不依赖检查点。
 
 ## 结果确定性保证
 
@@ -174,7 +195,7 @@ magic="ETSR-CKPT", version=1, seq, created_at,
 window_ns, lateness_ns,
 sources: { name: { offset(已消费条数), watermark } },
 window_state: [打开中的窗口：聚合值、原始事件值（确定求和用）、事件ID去重集合],
-emitted:     [保留尾部内的已发布窗口结果（用于输出重建与恢复重放）],
+emitted:     [保留尾部内的已发布窗口结果（用于恢复重放：补写输出缺失尾部）],
 next_emit_seq: 下一个发射序号（已发布记录被修剪后仍保持单调）,
 checksum:    以上字段规范 JSON 的 SHA-256 hex
 ```
@@ -192,8 +213,9 @@ checksum:    以上字段规范 JSON 的 SHA-256 hex
 | `BAD_CONFIG`            | 窗口大小/迟到配置不一致，或恢复源集合不一致      |
 
 恢复流程：校验通过 → 还原窗口/去重状态与各源水位下界 → 按偏移跳过已消费记录 →
-先重放全部已提交结果（按 `emit_seq`）→ 再继续消费。恢复期间不会发布任何
-未提交结果。
+输出汇对账已有输出文件（保留完整行、剥除崩溃半行、记录已持久化 emit_seq
+前缀）→ 按 `emit_seq` 重放检查点中的已提交尾部（前缀内的跳过）→ 再继续
+消费。恢复期间不会发布任何未提交结果。
 
 **兼容范围（当前版本 v1）**：仅接受 `version=1`、且窗口大小与允许迟到
 与当前配置一致、源集合（按源名）完全一致的检查点。不同窗口/迟到语义会改变
@@ -209,7 +231,7 @@ checksum:    以上字段规范 JSON 的 SHA-256 hex
 | `CheckpointEvery`  | `-every`     | 1000  | 每处理多少条有效事件额外做一次周期检查点          |
 | `MaxOutofOrder`    | `-max-ahead` | 0     | 事件时间相对全局水位的最大超前；0=不限            |
 | `CheckpointPath`   | `-checkpoint`| 无    | 检查点文件路径；提供即启用崩溃恢复                |
-| `EmittedRetention` | `-retention` | 0     | 已发布结果保留秒数（事件时间）；0=永久保留        |
+| `EmittedRetention` | `-retention` | 0     | 已发布结果在**内存/检查点**中的保留秒数（事件时间）；0=永久保留。输出文件始终保留全部结果 |
 | —                  | `-status-interval` | 0 | 运行中每 N 秒向 stderr 打印状态摘要；0=不打印     |
 
 其他 CLI：`-inputs a.csv,b.csv`（多源，逗号分隔）、`-out`（JSON Lines 输出）、
@@ -240,7 +262,15 @@ go test ./...
 go test -race -count=5 ./...          # 竞态检测 + 多轮调度压力
 
 # 针对性验证新增能力（日志会打印各场景结论）
-go test ./stream/ -run 'TestLongRun' -v        # 两档窗口总量下状态体积有界 + 保留策略下恢复不重不漏
+go test ./stream/ -run 'TestLongRun' -v        # 两档窗口总量下状态体积有界
+go test ./stream/ -run 'TestOutputSurvivesRestartWithFiniteRetention' -v \
+  # 300/3000 两档 + 有限保留 + 多次重启（含追加），输出与一次性运行逐窗口一致（含小数比特）
+go test ./stream/ -run 'TestOutputTornLastLineRecovery' -v \
+  # 写结果半行崩溃后的恢复：完整行保留、半行剥除、窗口不重不漏
+go test ./stream/ -run 'TestOutputRejectsCorruptCompleteLines' -v \
+  # 完整行损坏 / emit_seq 断档时拒绝启动
+go test ./stream/ -run 'TestOutputRestartStateStaysBounded' -v \
+  # 增量重启到 3000 窗：检查点始终 ~7KB，输出含全部 12000 条
 go test ./stream/ -run 'Deterministic' -v      # 求和顺序无关 + 交错/重复投递下结果逐比特一致
 go test ./stream/ -run 'TestStatusSnapshot' -v # 运行中读取状态摘要
 
@@ -260,11 +290,15 @@ CSV
 # 无检查点（内存确定性运行）
 go run ./cmd/etsr -inputs /tmp/a.csv,/tmp/b.csv -window 60 -lateness 0
 
-# 启用检查点（崩溃恢复；输出文件在每次启动时按已提交状态重建，不重不漏）
+# 启用检查点（崩溃恢复；输出文件追加保留全部历史，启动时对账去重，不重不漏）
 go run ./cmd/etsr -inputs /tmp/a.csv,/tmp/b.csv \
   -checkpoint /tmp/ck.json -out /tmp/out.jsonl -errors /tmp/err.log \
   -window 60 -lateness 0 -every 1
-# 再次运行（模拟重启，输入不变）：ingested=0，已提交结果按 emit_seq 完整重放
+# 再次运行（模拟重启，输入不变）：ingested=0，windows=0，输出行数不变（不重发）
+go run ./cmd/etsr -inputs /tmp/a.csv,/tmp/b.csv \
+  -checkpoint /tmp/ck.json -out /tmp/out.jsonl -window 60 -lateness 0 -every 1
+# 模拟输出最后一行写了一半后崩溃：剥掉半行、重放补写，行数恢复且该窗口不重复
+size=$(stat -c%s /tmp/out.jsonl); truncate -s $((size-30)) /tmp/out.jsonl
 go run ./cmd/etsr -inputs /tmp/a.csv,/tmp/b.csv \
   -checkpoint /tmp/ck.json -out /tmp/out.jsonl -window 60 -lateness 0 -every 1
 # 损坏检查点：以可区分原因拒绝（退出码 3）
@@ -299,11 +333,14 @@ func main() {
 EOF
 go run /tmp/gen.go
 
-# 保留 120s：检查点体积只与保留尾部相称，不随 600 个窗口的总量增长
+# 保留 120s：检查点体积只与保留尾部相称，不随 600 个窗口的总量增长；
+# 输出文件追加写、重启不截断，无论重启多少次都保留全部窗口结果。
 go run ./cmd/etsr -inputs /tmp/long.csv -window 60 -lateness 5 -retention 120 \
   -checkpoint /tmp/long-ck.json -out /tmp/long-out.jsonl -every 50 -status-interval 1
 ls -l /tmp/long-ck.json     # 只有几 KB；把 600 改成 6000 再跑，体积基本不变
 wc -l /tmp/long-out.jsonl   # 结果不丢不重：600 窗 x 3 键 = 1800 行
+# 同输入重启：输出仍为 1800 行（windows=0，前缀结果去重跳过）；
+# 往 long.csv 追加若干窗再重启：行数恰为新的窗口总数，历史一行不少。
 ```
 
 ## 测试覆盖一览
@@ -321,6 +358,20 @@ wc -l /tmp/long-out.jsonl   # 结果不丢不重：600 窗 x 3 键 = 1800 行
   运行中轮询 `Status` 验证活跃窗口数与保留尾部有界、最终检查点体积
   不随总量增长；保留策略下重启只重放有界尾部、`emit_seq` 跨修剪单调、
   多阶段结果并集与一次性运行逐窗口一致。
+- `output_recovery_test.go`（追加式输出汇的重启恢复）：
+  - `TestOutputSurvivesRestartWithFiniteRetention`：300/3000 两档差十倍
+    总量、有限保留（2 分钟，对两档都大量修剪）、纯重启 + 追加后再重启，
+    输出文件与一次性运行**逐窗口**对比 `count/sum/min/max(按浮点比特)/
+    first_event_id` 完全一致，行数=窗口总数、`emit_seq` 连续无重号；
+  - `TestOutputTornLastLineRecovery`：故障注入“检查点已提交、结果行
+    写到一半崩溃”，重启后此前完整行原样保留、半行被剥除，截断窗口由
+    重放恰好补写一次；再追加数据两次重启仍与一次性运行一致；无换行
+    收尾（哪怕恰好可解析）的末行同样不信任；
+  - `TestOutputRejectsCorruptCompleteLines`：完整行损坏 / `emit_seq`
+    断档时引擎明确报错拒绝启动，不静默丢历史；
+  - `TestOutputRestartStateStaysBounded`：从 300 窗逐段追加、9 次重启
+    累积到 3000 窗，检查点峰值 ~7KB（与一次跑到 3000 相当），输出
+    文件含全部 12000 条结果、每个窗口恰好一行。
 - `determinism_test.go`：求和原语对任意打乱逐比特稳定（含朴素累加
   随顺序变化的反例对照）；同一逻辑输入在单源顺序/多源交错/重复投递/
   启用检查点四种形态下，逐窗口聚合结果（含小数 Sum 的比特）完全一致。

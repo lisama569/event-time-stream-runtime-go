@@ -57,6 +57,20 @@ func NewEngine(cfg Config, onError ErrorHandler) *Engine {
 	return &Engine{cfg: cfg, onError: onError}
 }
 
+// resumePreparer 由需要在 Run 开始时对自身持久介质做“截断或恢复对账”
+// 的汇实现（如 CommittedFileSink）。引擎在判定是否存在可用检查点之后、
+// 重放任何结果之前恰好调用一次。
+type resumePreparer interface {
+	PrepareResume(fromCheckpoint bool) error
+}
+
+// durableSeqSource 由追加式持久汇实现：返回重放开始前输出介质中已完整
+// 持久化的最大 emit_seq（0 表示空文件），用于把去重跳过的重放结果
+// 排除在本次运行的发射计数之外。
+type durableSeqSource interface {
+	DurableSeq() int64
+}
+
 // offsetSeeker 是支持按偏移恢复的源（SliceSource/FileSource 均实现）。
 type offsetSeeker interface {
 	SeekOffset(n int64) error
@@ -112,14 +126,34 @@ func (e *Engine) Run(ctx context.Context, sources []Source, sink Sink) (retErr e
 		}
 	}
 
+	// 让汇在重放前完成输出介质的“全新截断 / 恢复对账”：
+	// 追加式文件汇据此保留全部已持久化历史（含被保留策略修剪出检查点的
+	// 结果），剥掉崩溃残留的半行，并对重放结果按 emit_seq 去重。
+	if rp, ok := sink.(resumePreparer); ok {
+		if err := rp.PrepareResume(haveCkpt); err != nil {
+			return err
+		}
+	}
+
 	e.emitSeq = store.NextSeq()
 
 	// 恢复：按确定顺序重放已提交结果到（全新打开的）汇；完成前不处理新事件。
 	if haveCkpt {
-		if err := emitReplay(sink, store.EmittedResults()); err != nil {
+		// 追加式文件汇中已存在于输出文件前缀内的结果会被去重跳过，
+		// 不计入本次运行的发射计数。
+		durable := int64(0)
+		if ds, ok := sink.(durableSeqSource); ok {
+			durable = ds.DurableSeq()
+		}
+		replayed := store.EmittedResults()
+		if err := emitReplay(sink, replayed); err != nil {
 			return fmt.Errorf("replay committed results: %w", err)
 		}
-		e.stats.WindowsEmitted = int64(len(store.EmittedResults()))
+		for _, r := range replayed {
+			if r.EmitSeq > durable {
+				e.stats.WindowsEmitted++
+			}
+		}
 	}
 
 	// 恢复各源消费偏移。

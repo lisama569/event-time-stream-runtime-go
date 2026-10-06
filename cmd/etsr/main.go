@@ -21,7 +21,7 @@ import (
 func main() {
 	var (
 		inputs    = flag.String("inputs", "", "逗号分隔的本地输入文件路径，可多个")
-		out       = flag.String("out", "", "窗口结果输出文件（JSON Lines）；提供检查点时启动会按已提交状态重建。默认 stdout（崩溃恢复可能重复，仅演示用）")
+		out       = flag.String("out", "", "窗口结果输出文件（JSON Lines）；与检查点一起使用时追加保留全部历史，启动时按 emit_seq 对账（剥崩溃半行、去重补写）。默认 stdout（崩溃恢复可能重复，仅演示用）")
 		ckptPath  = flag.String("checkpoint", "", "检查点文件路径；提供则启用崩溃恢复（原子写、严格校验）")
 		windowSec = flag.Int("window", 60, "窗口长度（秒）")
 		lateSec   = flag.Int("lateness", 10, "允许迟到（秒）：水位越过 window_end+lateness 后窗口最终关闭")
