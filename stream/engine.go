@@ -114,7 +114,19 @@ func (e *Engine) Run(ctx context.Context, sources []Source, sink Sink) (retErr e
 
 	e.emitSeq = store.NextSeq()
 
-	// 恢复：按确定顺序重放已提交结果到（全新打开的）汇；完成前不处理新事件。
+	if !haveCkpt {
+		// 全新启动（无有效检查点）：让支持重置的汇丢弃上一轮运行的
+		// 残留输出，本次运行从头重建；有检查点时绝不重置——恢复重建
+		// 依赖文件中已落盘的历史结果（保留范围之外的部分只存在于那里）。
+		if rs, ok := sink.(interface{ Reset() error }); ok {
+			if err := rs.Reset(); err != nil {
+				return fmt.Errorf("reset sink: %w", err)
+			}
+		}
+	}
+
+	// 恢复：按确定顺序重放已提交结果到汇；完成前不处理新事件。
+	// 文件汇按 emit_seq 高水位幂等跳过已落盘部分，只补齐缺失尾部。
 	if haveCkpt {
 		if err := emitReplay(sink, store.EmittedResults()); err != nil {
 			return fmt.Errorf("replay committed results: %w", err)
